@@ -1,27 +1,101 @@
 name: Build and publish image
 
+# Manual workflow inputs: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onworkflow_dispatchinputs
 on:
   workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character commit SHA to build
+        required: true
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
+    # Attestation permissions: https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
 
     steps:
+      - name: Validate commit
+        id: source
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Enter a full lowercase 40-character commit SHA." >&2
+            exit 1
+          fi
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
       - name: Check out repository
+        # Checkout by commit SHA: https://github.com/actions/checkout#usage
         uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.source.outputs.commit }}
+          persist-credentials: false
+
+      - name: Confirm checkout
+        env:
+          COMMIT: ${{ steps.source.outputs.commit }}
+        run: test "$(git rev-parse HEAD)" = "$COMMIT"
+
+      - name: Set image name
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and publish
+        id: build
+        # Build provenance and SBOM: https://docs.docker.com/build/ci/github-actions/attestations/
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          push: true
+          tags: ${{ steps.image.outputs.name }}:sha-${{ steps.source.outputs.commit }}-run-${{ github.run_id }}-${{ github.run_attempt }}
+          # OCI metadata keys: https://github.com/opencontainers/image-spec/blob/main/annotations.md#pre-defined-annotation-keys
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.commit }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest image provenance
+        # Container attestations: https://github.com/actions/attest#container-image
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify signed provenance
+        # Verification options: https://cli.github.com/manual/gh_attestation_verify
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
           REPOSITORY: ${{ github.repository }}
-          ACTOR: ${{ github.actor }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
-          IMAGE="ghcr.io/${REPOSITORY,,}:latest"
-          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-          docker build -f Containerfile -t "$IMAGE" .
-          docker push "$IMAGE"
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" \
+            --repo "$REPOSITORY" \
+            --signer-workflow "$REPOSITORY/.github/workflows/build-image.yml" \
+            --deny-self-hosted-runners
+          echo "Verified image: \`${IMAGE}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source commit: \`${COMMIT}\`" >> "$GITHUB_STEP_SUMMARY"
